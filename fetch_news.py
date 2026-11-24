@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Fetches public anime and manga news feeds and writes data/news.json.
+Standard library only. One broken feed never stops the others."""
+import hashlib, html, json, re, sys, time, urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
+# (name, url, is_japanese)
+FEEDS = [
+    ("Anime News Network", "https://www.animenewsnetwork.com/all/rss.xml?ann-edition=us", False),
+    ("Crunchyroll News", "https://cr-news-api-service.prd.crunchyrollsvc.com/v1/en-US/rss", False),
+    ("MyAnimeList", "https://myanimelist.net/rss/news.xml", False),
+    ("Anime Corner", "https://animecorner.me/feed/", False),
+    ("Comic Natalie", "https://natalie.mu/comic/feed/news", True),
+    ("Anime! Anime!", "https://animeanime.jp/rss/index.rdf", True),
+]
+UA = "Mozilla/5.0 (compatible; HoshiNewsBot/1.0; personal use)"
+MAX_AGE_DAYS, PER_SOURCE, TOTAL = 10, 40, 160
+MANGA = re.compile(r"manga|chapter|volume|light novel|serializ|webtoon|コミック|漫画|連載|単行本|巻", re.I)
+BREAKING = re.compile(r"announc|premiere|release date|confirmed|new season|season \d+|sequel|trailer|film|movie|決定|発表|制作|公開|第\d+期", re.I)
+
+def fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/rss+xml, application/xml, text/xml, */*"})
+    with urllib.request.urlopen(req, timeout=25) as r:
+        return r.read()
+
+def local(tag):
+    return tag.rsplit("}", 1)[-1].lower() if isinstance(tag, str) else ""
+
+def text_of(el, names):
+    for c in el:
+        if local(c.tag) in names and (c.text or "").strip():
+            return c.text.strip()
+    return ""
+
+def strip_html(t):
+    t = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", t or "", flags=re.S | re.I)
+    t = re.sub(r"<[^>]+>", " ", t)
+    return re.sub(r"\s+", " ", html.unescape(t)).strip()
+
+def excerpt(t, n=300):
+    t = re.sub(r"(Read more|Continue reading|The post .* appeared first on .*)$", "", t, flags=re.I).strip()
+    if len(t) <= n:
+        return t
+    cut = t[:n].rsplit(" ", 1)[0] if " " in t[:n] else t[:n]
+    return cut.rstrip(" ,;:.-") + "…"
+
+def parse_date(s):
+    if not s:
+        return None
+    try:
+        d = parsedate_to_datetime(s)
+    except Exception:
+        try:
+            d = datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d
+
+def link_of(el):
+    for c in el:
+        if local(c.tag) == "link":
+            if c.text and c.text.strip():
+                return c.text.strip()
+            if c.get("href") and c.get("rel", "alternate") == "alternate":
+                return c.get("href")
+    return text_of(el, {"guid", "id"})
+
+def image_of(el, raw_html):
+    for c in el.iter():
+        t = local(c.tag)
+        u = c.get("url") or ""
+        if t == "thumbnail" and u:
+            return u
+        if t == "content" and u and (c.get("medium") == "image" or (c.get("type") or "").startswith("image")):
+            return u
+        if t == "enclosure" and u and (c.get("type") or "").startswith("image"):
+            return u
+    m = re.search(r"<img[^>]+src=[\"']([^\"']+)", raw_html or "", re.I)
+    return m.group(1) if m else ""
+
+def classify(title, jp):
+    if MANGA.search(title):
+        tag = "Manga"
+    else:
+        tag = "Anime"
+    if BREAKING.search(title):
+        tag = "Breaking"
+    return tag
+
+def parse(raw, source, jp):
+    root = ET.fromstring(raw)
+    items = []
+    for el in root.iter():
+        if local(el.tag) not in ("item", "entry"):
+            continue
+        title = strip_html(text_of(el, {"title"}))
+        link = link_of(el)
+        if not title or not link.startswith(("http://", "https://")):
+            continue
+        body = ""
+        for c in el:
+            if local(c.tag) in ("encoded", "content", "description", "summary") and (c.text or "").strip():
+                if len(c.text) > len(body):
+                    body = c.text
+        d = parse_date(text_of(el, {"pubdate", "date", "published", "updated"}))
+        img = image_of(el, body)
+        if not img.startswith("https://"):
+            img = ""
+        items.append({
+            "id": hashlib.sha1(link.encode()).hexdigest()[:10],
+            "src": source, "title": title[:240], "link": link,
+            "ts": int((d or datetime.now(timezone.utc)).timestamp() * 1000),
+            "img": img, "ex": excerpt(strip_html(body)) if not jp else excerpt(strip_html(body), 160),
+            "tag": classify(title, jp), "jp": 1 if jp else 0,
+        })
+    return items
+
+def main(out="data/news.json", fetcher=fetch):
+    allitems, ok = [], 0
+    for name, url, jp in FEEDS:
+        try:
+            its = parse(fetcher(url), name, jp)
+            print(f"{name}: {len(its)} items")
+            allitems += sorted(its, key=lambda x: -x["ts"])[:PER_SOURCE]
+            ok += 1
+        except Exception as e:
+            print(f"FAILED {name}: {e}", file=sys.stderr)
+    now = int(time.time() * 1000)
+    seen, items = set(), []
+    for it in sorted(allitems, key=lambda x: -x["ts"]):
+        if it["link"] in seen or it["ts"] < now - MAX_AGE_DAYS * 864e5:
+            continue
+        seen.add(it["link"])
+        it["ts"] = min(it["ts"], now)
+        items.append(it)
+    items = items[:TOTAL]
+    if not ok or not items:
+        print("No news fetched; leaving the existing file untouched.", file=sys.stderr)
+        sys.exit(1)
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump({"updated": now, "items": items}, f, ensure_ascii=False, separators=(",", ":"))
+    print(f"Wrote {len(items)} items from {ok} sources")
+
+if __name__ == "__main__":
+    main()
